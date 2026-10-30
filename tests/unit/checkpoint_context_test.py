@@ -96,6 +96,17 @@ class TestBuildContext(unittest.TestCase):
         int(datetime.timedelta(minutes=60).total_seconds()),
     )
 
+  def test_explicit_async_checkpointing_timeout_secs(self):
+    ctx = checkpoint_context.build_context(async_checkpointing_timeout_secs=2400)
+    self.assertEqual(ctx.asynchronous.timeout_secs, 2400)
+
+  def test_continuous_with_explicit_override_uses_override(self):
+    ctx = checkpoint_context.build_context(
+        enable_continuous_checkpointing=True,
+        async_checkpointing_timeout_secs=600,
+    )
+    self.assertEqual(ctx.asynchronous.timeout_secs, 600)
+
   def test_todelete_full_path(self):
     ctx = checkpoint_context.build_context(todelete_full_path="trash")
     self.assertEqual(ctx.deletion.gcs_deletion_options.todelete_full_path, "trash")

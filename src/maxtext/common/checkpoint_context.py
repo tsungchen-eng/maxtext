@@ -87,6 +87,7 @@ def build_context(
     ocdbt_target_data_file_size_bytes: int | None = None,
     checkpoint_storage_concurrent_gb: int | None = None,
     enable_continuous_checkpointing: bool = False,
+    async_checkpointing_timeout_secs: int | None = None,
     todelete_full_path: str | None = None,
     todelete_subdir: str | None = None,
     enable_single_replica_ckpt_restoring: bool = False,
@@ -108,7 +109,10 @@ def build_context(
       the per-array ``chunk_byte_size`` (matching the v0 ``SaveArgs`` value).
     checkpoint_storage_concurrent_gb: Concurrent IO budget in GB; applied to
       both write and read as a byte limit (v0 used one value for both).
-    enable_continuous_checkpointing: If true, set a 60-minute async timeout.
+    enable_continuous_checkpointing: If true, set a 60-minute async timeout unless
+      `async_checkpointing_timeout_secs` is also set.
+    async_checkpointing_timeout_secs: Optional deadline in seconds for async
+      checkpoint saves.
     todelete_full_path: GCS soft-delete path.
     todelete_subdir: Subdirectory renaming hook for deletions.
     enable_single_replica_ckpt_restoring: Restore on one replica and broadcast
@@ -140,6 +144,8 @@ def build_context(
 
   if enable_continuous_checkpointing:
     ctx.asynchronous.timeout_secs = int(datetime.timedelta(minutes=60).total_seconds())
+  if async_checkpointing_timeout_secs is not None:
+    ctx.asynchronous.timeout_secs = async_checkpointing_timeout_secs
 
   if todelete_full_path is not None:
     ctx.deletion.gcs_deletion_options.todelete_full_path = todelete_full_path
