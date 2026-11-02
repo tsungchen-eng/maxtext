@@ -17,6 +17,7 @@
 import glob
 import math
 import os
+import re
 from unittest import mock
 
 from absl.testing import absltest
@@ -25,7 +26,9 @@ import jax
 import numpy as np
 
 from maxtext.configs import pyconfig
+from maxtext.m3 import models as m3_models
 from maxtext.m3.core.sharding import create_mesh
+from maxtext.m3.infra.named_scopes import add_named_scopes
 from maxtext.m3.train import loop
 from tests.utils.test_helpers import get_test_config_path
 
@@ -88,6 +91,19 @@ class TrainLoopTest(absltest.TestCase):
     loop.train_loop(config)
     traces = glob.glob(os.path.join(config.tensorboard_dir, "**", "*.xplane.pb"), recursive=True)
     self.assertNotEmpty(traces, f"no .xplane.pb under {config.tensorboard_dir}")
+
+  def test_train_step_ops_carry_named_scopes(self):
+    config = _tiny_config(self.output_dir)
+    mesh = create_mesh()
+    with jax.set_mesh(mesh):
+      model = add_named_scopes(m3_models.create_model(config, mesh, rngs=nnx.Rngs(0)))
+      optimizer = nnx.Optimizer(model, loop.make_optimizer(config), wrt=nnx.Param)
+      batch = loop.make_synthetic_batch(config, mesh, jax.random.key(0))
+      hlo = loop.train_step.lower(model, optimizer, batch).compile().as_text()
+    # Scopes entered under `value_and_grad` read `jvp(decoder)/...`; drop the transform wrappers.
+    names = {re.sub(r"\w+\(|\)", "", n) for n in re.findall(r'op_name="([^"]*)"', hlo)}
+    for scope in ("decoder/layers/0/mlp/wi_0/", "cross_entropy/", "optimizer/"):
+      self.assertTrue(any(scope in n for n in names), f"no op under {scope}")
 
   def test_train_loop_avoids_per_step_graph_traversal(self):
     with (

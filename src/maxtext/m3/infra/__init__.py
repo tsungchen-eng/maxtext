@@ -16,6 +16,8 @@
 
 Modules:
   * `scan.py` — layer stacking via `jax.lax.scan` + `maybe_apply_scan`.
+  * `named_scopes.py` — `jax.named_scope` per submodule, so profiles and HLO
+    dumps read `decoder/layers/3/mlp/wi_0` as they do under Linen.
 
 Planned modules:
   * `remat.py` — path-transparent remat wrapper + `maybe_apply_remat`.
@@ -23,7 +25,7 @@ Planned modules:
   * `offload.py` — `to_host` for optimizer/parameter offloading.
 
 Planned composition order:
-`construct -> remat -> scan -> quantize -> optimizer -> host offload`.
+`construct -> remat -> scan -> quantize -> named scopes -> optimizer -> host offload`.
 
 Model files contain only zero-cost annotations (`checkpoint_name` tags and
 sharding specs); they must never import from this package.

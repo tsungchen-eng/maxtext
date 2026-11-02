@@ -57,6 +57,7 @@ from maxtext.configs import pyconfig
 from maxtext.m3 import models as m3_models
 from maxtext.m3.core.sharding import create_mesh
 from maxtext.m3.infra import scan as m3_scan
+from maxtext.m3.infra.named_scopes import add_named_scopes
 from maxtext.optimizers import optimizers
 from maxtext.utils import max_logging
 
@@ -104,15 +105,17 @@ def make_synthetic_batch(config, mesh: Mesh, key: jax.Array) -> dict[str, jax.Ar
 def loss_fn(model: nnx.Module, batch: dict[str, jax.Array]) -> jax.Array:
   """Mean next-token cross entropy, computed in float32."""
   logits = model(batch["inputs"], batch["positions"])
-  losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), batch["targets"])
-  return jnp.mean(losses)
+  with jax.named_scope("cross_entropy"):
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), batch["targets"])
+    return jnp.mean(losses)
 
 
 @nnx.jit(donate_argnums=(0, 1))
 def train_step(model: nnx.Module, optimizer: nnx.Optimizer, batch: dict[str, jax.Array]) -> jax.Array:
   """One forward/backward/update. Mutates `model` and `optimizer` in place."""
   loss, grads = nnx.value_and_grad(loss_fn)(model, batch)
-  optimizer.update(model, grads)
+  with jax.named_scope("optimizer"):
+    optimizer.update(model, grads)
   return loss
 
 
@@ -150,6 +153,7 @@ def train_loop(config) -> float:
   with jax.set_mesh(mesh):
     model = m3_models.create_model(config, mesh, rngs=nnx.Rngs(config.init_weights_seed))
     model = m3_scan.maybe_apply_scan(model, config)
+    model = add_named_scopes(model)
     optimizer = nnx.Optimizer(model, make_optimizer(config), wrt=nnx.Param)
 
     num_params = sum(x.size for x in jax.tree.leaves(nnx.state(model, nnx.Param)))
