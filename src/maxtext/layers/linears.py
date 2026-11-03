@@ -460,6 +460,7 @@ class DenseGeneral(nnx.Module):
       _initializing: bool = False,
       out_sharding: NamedSharding | None = None,
       slice_bounds: tuple[int, int] | None = None,
+      kernel_all_gather_fn: Callable[[Array], Array] | None = None,
   ) -> Array:
     """Applies a linear transformation to the inputs along multiple dimensions.
 
@@ -529,6 +530,8 @@ class DenseGeneral(nnx.Module):
       kernel = kernel[..., begin:end]
 
     kernel = self._maybe_two_stage_all_gather(kernel)
+    if kernel_all_gather_fn is not None:
+      kernel = kernel_all_gather_fn(kernel)
 
     # out_sharding should be None for auto mesh axis
     if self.shard_mode != ShardMode.EXPLICIT:

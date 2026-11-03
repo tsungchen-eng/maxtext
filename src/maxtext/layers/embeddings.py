@@ -104,7 +104,7 @@ class Embed(nnx.Module):
         sharding=("vocab", "embed_vocab"),
     )
 
-  def __call__(self, inputs: Array, model_mode: str = MODEL_MODE_TRAIN) -> Array:
+  def __call__(self, inputs: Array, model_mode: str = MODEL_MODE_TRAIN, lookup_fn: Any = None) -> Array:
     """Embeds the inputs along the last dimension.
 
     Args:
@@ -148,6 +148,8 @@ class Embed(nnx.Module):
       iota = lax.iota(jnp.int32, self.num_embeddings)
       one_hot = jnp.array(inputs[..., jnp.newaxis] == iota, dtype=self.dtype)
       output = jnp.dot(one_hot, embedding, out_sharding=out_sharding)
+    elif lookup_fn is not None:
+      output = lookup_fn(embedding, inputs, out_sharding)
     else:
       output = embedding.at[inputs].get(out_sharding=out_sharding)
 
