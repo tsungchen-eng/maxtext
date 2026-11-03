@@ -24,6 +24,7 @@ import gc
 import pytest
 import sys
 import warnings
+import zlib
 
 warnings.filterwarnings(
     "ignore", message="builtin type swigvarlink has no __module__ attribute", category=DeprecationWarning
@@ -67,6 +68,7 @@ if _has_gpu:
     _ = jax.devices()
   except Exception:  # pylint: disable=broad-exception-caught
     pass
+
 
 # --- Monkeypatch for absl.testing.parameterized ---
 # Context: Decorating a test method with @parameterized.named_parameters returns a custom
@@ -127,6 +129,53 @@ if is_decoupled():
 GCP_MARKERS = {"external_serving", "external_training"}
 HARDWARE_MARKERS = {"tpu_only", "gpu_only", "cpu_only"}
 
+# Test modules whose individual tests need multiple GB of host RAM: AOT compiles of 30B-300B
+# parameter models for 64-256 chip topologies (train_compile_test), and HF-vs-MaxText parity
+# tests that hold a PyTorch and a JAX copy of a multi-layer model, often in float64. Measured on
+# a CPU host with the CI JAX/libtpu versions, single tests in these modules peak at 10-16 GB, and
+# a pytest process that has run one of them keeps ~6 GB resident afterwards. Under pytest-xdist
+# with 32 workers this is what exhausts the cpu-unit runner (see
+# https://github.com/AI-Hypercomputer/maxtext/issues/6052). Tests here are auto-marked
+# `memory_heavy`; see `_bound_memory_heavy_concurrency` for what that does.
+MEMORY_HEAVY_PATH_PREFIXES = (
+    "tests/unit/train_compile_test.py",
+    "tests/unit/gemma4_layers_test.py",
+    "tests/unit/m3/glm5_3_flash_",
+)
+# How many `memory_heavy` tests may run concurrently per pytest-xdist session. Each occupied slot
+# is a worker holding a 10-16 GB peak; 6 keeps the heavy tail under ~100 GB while leaving its
+# critical path (one 17-minute compile) unchanged. Override per job with MAXTEXT_MEMORY_HEAVY_SLOTS.
+DEFAULT_MEMORY_HEAVY_SLOTS = 6
+
+
+def _is_memory_heavy(item) -> bool:
+  return item.nodeid.startswith(MEMORY_HEAVY_PATH_PREFIXES)
+
+
+def _bound_memory_heavy_concurrency(config, items):
+  """Limits how many `memory_heavy` tests pytest-xdist runs at once.
+
+  pytest-xdist's `--dist loadgroup` runs every test carrying the same `xdist_group` name on a
+  single worker, serially. Hashing the heavy tests into N group names therefore caps their
+  concurrency at N (and confines the memory they retain to at most N workers) without
+  hand-assigning tests to groups and without changing how the light tests are scheduled.
+  No-op unless xdist is active with `--dist loadgroup`, so single-process and accelerator runs
+  (which do not install xdist, and run `--strict-markers`) are untouched.
+  """
+  if not config.pluginmanager.hasplugin("xdist"):
+    return
+  if not (config.getoption("loadgroup", default=False) or config.getoption("dist", default="no") == "loadgroup"):
+    return
+  slots = int(os.environ.get("MAXTEXT_MEMORY_HEAVY_SLOTS", DEFAULT_MEMORY_HEAVY_SLOTS))
+  if slots <= 0:
+    return
+  for item in items:
+    if item.get_closest_marker("memory_heavy") and not item.get_closest_marker("xdist_group"):
+      # Per test, not per file: the heavy modules carry ~170 CPU-minutes each per shard, so a
+      # whole-module group would serialize them onto one worker and triple the shard wall time.
+      group = zlib.crc32(item.nodeid.encode()) % slots
+      item.add_marker(pytest.mark.xdist_group(name=f"memory_heavy_{group}"))
+
 
 def _has_tpu_backend_support() -> bool:
   """Whether JAX has TPU backend support installed (PJRT TPU plugin).
@@ -146,6 +195,7 @@ def _has_tpu_backend_support() -> bool:
     return False
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
   """Customize pytest collection behavior.
 
@@ -153,6 +203,11 @@ def pytest_collection_modifyitems(config, items):
   - Deselect tests marked as external_serving/training in decoupled mode.
   - Mark remaining tests with the `decoupled` marker when running decoupled.
   - Mark tests without explicit hardware markers as `cpu_only`.
+  - Mark multi-GB tests `memory_heavy` and bound their concurrency under pytest-xdist.
+
+  `tryfirst` because pytest-xdist's worker plugin (registered after this conftest, so otherwise
+  run before it) bakes `xdist_group` names into node ids in its own copy of this hook; the
+  `memory_heavy` groups must exist by then or `--dist loadgroup` silently ignores them.
   """
 
   changed_tests = get_changed_tests()  # set[(file_path, test_name)]
@@ -207,6 +262,12 @@ def pytest_collection_modifyitems(config, items):
     if cur_test_markers.isdisjoint(HARDWARE_MARKERS):
       item.add_marker(pytest.mark.cpu_only)
 
+  # Mark the multi-GB tests and, under pytest-xdist, cap how many of them run at once.
+  for item in remaining:
+    if _is_memory_heavy(item):
+      item.add_marker(pytest.mark.memory_heavy)
+  _bound_memory_heavy_concurrency(config, remaining)
+
 
 def pytest_addoption(parser):
   """Registers the class-level shard split options; pass them as --opt=value (see tests/utils/class_split.py)."""
@@ -225,6 +286,8 @@ def pytest_configure(config):
       "decoupled: marked on tests that are not skipped due to GCP deps, when DECOUPLE_GCLOUD=TRUE",
       "skip_on_tpu7x: skip test if running on TPU7x platform",
       "newly_added: newly introduced or modified tests in PRs, executed even if scheduled_only",
+      "memory_heavy: tests that peak at many GB of host RAM (large AOT compiles, torch+JAX parity);"
+      " auto-applied by path, concurrency-limited under pytest-xdist --dist loadgroup",
   ]:
     config.addinivalue_line("markers", m)
   class_split.pytest_configure(config)
@@ -245,6 +308,24 @@ def clear_jax_compilation_cache():
       gc.collect()
   except Exception:  # pylint: disable=broad-exception-caught
     pass
+
+
+@pytest.fixture(autouse=True)
+def release_memory_after_heavy_test(request):
+  """Drops JAX caches and collects garbage after each `memory_heavy` test, on every backend.
+
+  The module-scoped fixture above deliberately keeps caches warm on CPU, which is right for the
+  thousands of small tests. For the multi-GB ones it is the wrong trade: a long-lived xdist
+  worker that has run one AOT compile otherwise keeps several GB resident for the rest of the
+  session (measured ~6 GB after a single `TrainCompile` test), and 32 such workers add up.
+  """
+  yield
+  if request.node.get_closest_marker("memory_heavy"):
+    try:
+      jax.clear_caches()
+    except Exception:  # pylint: disable=broad-exception-caught
+      pass
+    gc.collect()
 
 
 @pytest.fixture(autouse=True)

@@ -237,6 +237,22 @@ jobs:
               fi
             fi
           fi
+          if [ "${INPUTS_DEVICE_TYPE}" = "cpu" ]; then
+            # CPU flavors fan out with pytest-xdist. Each worker is a long-lived JAX process that
+            # keeps the high-water mark of the heaviest test it ran, and the tail of cpu-unit is
+            # 10-16 GB AOT compiles (tests/conftest.py MEMORY_HEAVY_PATH_PREFIXES), so:
+            #  * 16 workers, not one per vCPU: halves the retained floor; the heavy tail is the
+            #    critical path anyway, so wall time is unchanged (tools/dev/calculate_workers.py
+            #    already sizes shards assuming CPU_XDIST_PARALLELISM=16).
+            #  * --dist loadgroup lets tests/conftest.py cap concurrent memory_heavy tests
+            #    (MAXTEXT_MEMORY_HEAVY_SLOTS) instead of letting all 16 workers compile at once.
+            #  * MALLOC_ARENA_MAX limits per-thread glibc arenas so freed memory fragments less.
+            # Log the pod's memory budget so an OOM-killed shard leaves a number behind.
+            CPU_XDIST_ARGS="-n 16 --dist loadgroup"
+            export MALLOC_ARENA_MAX=2
+            echo "CPU runner budget: $(nproc) vCPU, cgroup memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo unknown)"
+            free -g || true
+          fi
           if [ "${INPUTS_TOTAL_WORKERS}" -gt 1 ] && [ "${INPUTS_DEVICE_TYPE}" = "tpu" ] && [[ "${INPUTS_FLAVOR}" == *-unit ]]; then
             # TPU unit flavors: whole test classes stay on one shard (tests/utils/class_split.py), so the first
             # test of a class pays its XLA compile in scheduled and PR runs alike. The rest keep pytest-split
@@ -259,13 +275,13 @@ jobs:
             fi
             if [ "${INPUTS_DEVICE_TYPE}" = "cpu" ]; then
               $PYTHON_EXE -m pip install --quiet pytest-xdist
-              SPLIT_ARGS="--splits ${INPUTS_TOTAL_WORKERS} --group ${INPUTS_WORKER_GROUP} -n auto ${SPLIT_ALGO}"
+              SPLIT_ARGS="--splits ${INPUTS_TOTAL_WORKERS} --group ${INPUTS_WORKER_GROUP} ${CPU_XDIST_ARGS} ${SPLIT_ALGO}"
             else
               SPLIT_ARGS="--splits ${INPUTS_TOTAL_WORKERS} --group ${INPUTS_WORKER_GROUP} ${SPLIT_ALGO}"
             fi
           elif [ "${INPUTS_DEVICE_TYPE}" = "cpu" ]; then
             $PYTHON_EXE -m pip install --quiet pytest-xdist
-            SPLIT_ARGS="-n auto"
+            SPLIT_ARGS="${CPU_XDIST_ARGS}"
           else
             SPLIT_ARGS=""
           fi

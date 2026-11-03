@@ -68,7 +68,7 @@ def calculate_workers(flavor: str, baseline_data: dict[str, float] | None = None
   if test_count == 0:
     return DEFAULT_WORKERS, [DEFAULT_WORKERS]
 
-  # CPU flavors run under pytest-xdist (-n auto on 32-vCPU runners), so summed per-test
+  # CPU flavors run under pytest-xdist (-n 16 in run_tests_against_package.yml), so summed per-test
   # durations reflect CPU-minutes across workers rather than single-VM wall-minutes.
   if flavor.startswith("cpu-"):
     effective_minutes = max(max(matching) / 60.0, total_minutes / CPU_XDIST_PARALLELISM)
