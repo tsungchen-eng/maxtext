@@ -65,6 +65,7 @@ from maxtext.models import (
     ming,
     mistral,
     mixtral,
+    muse_spark,
     olmo3,
     qwen2,
     qwen3,
@@ -633,6 +634,18 @@ class NNXDecoder(nnx.Module):
     self.is_qwen3_hybrid = self.config.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5)
     self.is_ming = self.config.decoder_block == DecoderBlockType.MING
     self.is_hy4 = self.config.decoder_block == DecoderBlockType.HY4
+    self.is_muse_spark = self.config.decoder_block == DecoderBlockType.MUSE_SPARK
+
+    if self.is_muse_spark:
+      self.embed_norm = muse_spark.MuseSparkRMSNorm(
+          num_features=config.emb_dim,
+          epsilon=config.normalization_layer_epsilon,
+          dtype=config.dtype,
+          weight_dtype=config.weight_dtype,
+          shard_mode=config.shard_mode,
+          with_scale=False,
+          rngs=rngs,
+      )
 
     if config.mhc_expansion_rate > 1 and config.decoder_block == DecoderBlockType.DEEPSEEK4:
       self.hc_head = mhc.DeepSeek4HyperHead(
@@ -757,6 +770,8 @@ class NNXDecoder(nnx.Module):
       self._init_scanned_ming(rngs)
     elif self.is_hy4:
       self._init_scanned_hy4(rngs)
+    elif self.is_muse_spark:
+      self._init_scanned_muse_spark(rngs)
     else:
       self._init_scanned_generic(decoder_block_classes, rngs)
 
@@ -1011,6 +1026,20 @@ class NNXDecoder(nnx.Module):
           rngs=rngs,
       )
 
+  def _init_scanned_muse_spark(self, rngs):
+    """Initializes Muse-Spark scanned layers: unrolls prefix layers and scans homogeneous 4-layer MoE cycles."""
+    config = self.config
+    num_prefix_layers, num_blocks, remainder_start = muse_spark.scan_layout(config)
+    for layer_idx in list(range(num_prefix_layers)) + list(range(remainder_start, config.num_decoder_layers)):
+      self._create_and_register_layer(muse_spark.MuseSparkDecoderLayer, rngs, "layers", layer_idx, layer_idx=layer_idx)
+    if num_blocks > 0:
+      self.scanned_blocks = self._create_scanned_layers(
+          muse_spark.MuseSparkScannableBlock,
+          length=num_blocks,
+          metadata_axis_name="scanned_blocks",
+          rngs=rngs,
+      )
+
   def _init_scanned_generic(self, decoder_block_classes, rngs):
     """Initializes scanned generic decoder layers."""
     config = self.config
@@ -1087,6 +1116,7 @@ class NNXDecoder(nnx.Module):
           DecoderBlockType.DEEPSEEK4,
           DecoderBlockType.MING,
           DecoderBlockType.HY4,
+          DecoderBlockType.MUSE_SPARK,
       }:
         layer_kwargs = {"layer_idx": lyr}
       elif config.decoder_block == DecoderBlockType.GPT_OSS:
@@ -1514,6 +1544,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.WEAVER: [weaver.WeaverMoTDecoderLayer],
         DecoderBlockType.MING: get_scannable(ming.MingDecoderLayer, ming.MingScannableBlock),
         DecoderBlockType.HY4: get_scannable(hy4.Hy4DecoderLayer, hy4.Hy4ScannableBlock),
+        DecoderBlockType.MUSE_SPARK: get_scannable(muse_spark.MuseSparkDecoderLayer, muse_spark.MuseSparkScannableBlock),
     }
 
     if cfg.decoder_block not in layer_map:
@@ -1704,6 +1735,14 @@ class NNXDecoder(nnx.Module):
           shard_mode=self.config.shard_mode,
           rngs=rngs,
       )
+    elif self.config.decoder_block == DecoderBlockType.MUSE_SPARK:
+      return functools.partial(
+          muse_spark.MuseSparkRMSNorm,
+          num_features=num_features,
+          shard_mode=self.config.shard_mode,
+          with_scale=True,
+          rngs=rngs,
+      )
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
 
@@ -1824,7 +1863,10 @@ class NNXDecoder(nnx.Module):
 
   def embed_tokens(self, shared_embedding, decoder_input_tokens, model_mode):
     """Looks up the token embeddings, before dropout and positional embeddings."""
-    return shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
+    y = shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
+    if self.is_muse_spark:
+      y = self.embed_norm(y)
+    return y
 
   def _reduce_mhc_streams(self, y):
     """Collapses a 4D mHC hidden state down to 3D.
@@ -1958,6 +2000,11 @@ class NNXDecoder(nnx.Module):
         logits = nnx.merge(head_graphdef, head_state)(y_head, out_sharding=out_sharding)
       else:
         logits = self.logits_dense(y, out_sharding=out_sharding)
+      if self.is_muse_spark:
+        logits = logits * cfg.muse_spark_output_multiplier
+      if cfg.final_logits_soft_cap:
+        logits = logits / cfg.final_logits_soft_cap
+        logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
 
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)
@@ -2414,6 +2461,8 @@ class NNXDecoder(nnx.Module):
           y = self._apply_ming_scanned_blocks(y, layer_args, layer_kwargs)
         elif self.is_hy4:
           y = self._apply_hy4_scanned_blocks(y, layer_args, layer_kwargs)
+        elif self.is_muse_spark:
+          y = self._apply_muse_spark_scanned_blocks(y, layer_args, layer_kwargs)
         else:
           cycle_interval = cfg.inhomogeneous_layer_cycle_interval
           scan_length = int(cfg.num_decoder_layers / cycle_interval)
@@ -2852,6 +2901,64 @@ class NNXDecoder(nnx.Module):
 
     for layer_idx in range(remainder_start, cfg.num_decoder_layers):
       y, prev_indexer_mask = apply_unrolled_layer(getattr(self, f"layers_{layer_idx}"), y, prev_indexer_mask)
+
+    return y
+
+  def _apply_muse_spark_scanned_blocks(self, y, layer_args, layer_kwargs):
+    """Applies Muse-Spark scanned decoder blocks: unrolled prefix layers, scanned cycles, unrolled remainder."""
+    cfg = self.config
+    num_prefix_layers, num_blocks, remainder_start = muse_spark.scan_layout(cfg)
+    use_remat = bool(cfg.remat_policy and cfg.remat_policy != "none")
+    policy = self.get_remat_policy() if use_remat else None
+    prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg) if use_remat else False
+    base_kwargs = dict(layer_kwargs)
+    routed_experts = base_kwargs.pop("forced_routed_experts", None)
+    fre_per_layer = (
+        forced_routed_experts_per_layer(routed_experts, cfg.num_decoder_layers) if routed_experts is not None else None
+    )
+
+    def apply_unrolled_layer(layer, inputs, layer_idx: int):
+      kw = dict(base_kwargs)
+      if fre_per_layer is not None:
+        kw["forced_routed_experts"] = fre_per_layer[layer_idx]
+      if use_remat:
+        decoder_segment_ids, decoder_positions, deterministic, model_mode = layer_args
+        return self._apply_layer_with_remat(
+            layer,
+            inputs,
+            policy,
+            prevent_cse,
+            decoder_segment_ids=decoder_segment_ids,
+            decoder_positions=decoder_positions,
+            deterministic=deterministic,
+            model_mode=model_mode,
+            **kw,
+        )
+      return layer(inputs, *layer_args, **kw)
+
+    for layer_idx in range(num_prefix_layers):
+      y, _ = apply_unrolled_layer(getattr(self, f"layers_{layer_idx}"), y, layer_idx)
+
+    if num_blocks > 0 and hasattr(self, "scanned_blocks"):
+      fre_scanned = None
+      if fre_per_layer is not None:
+        cycle = cfg.inhomogeneous_layer_cycle_interval
+        fre_scanned = jnp.reshape(
+            fre_per_layer[num_prefix_layers:remainder_start],
+            (num_blocks, cycle) + fre_per_layer.shape[1:],
+        )
+      y, self.scanned_blocks, _ = self._apply_layers_sequentially(
+          self.scanned_blocks,
+          y,
+          *layer_args,
+          length=num_blocks,
+          metadata_axis_name="scanned_blocks",
+          forced_routed_experts_scanned=fre_scanned,
+          **base_kwargs,
+      )
+
+    for layer_idx in range(remainder_start, cfg.num_decoder_layers):
+      y, _ = apply_unrolled_layer(getattr(self, f"layers_{layer_idx}"), y, layer_idx)
 
     return y
 

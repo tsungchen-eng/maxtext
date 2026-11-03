@@ -330,6 +330,7 @@ ModelName = Literal[
     "glm5.3-flash",
     "ming-3.0-audio-tiny",
     "hy4-preview",
+    "muse-spark-816b-a42b",
 ]
 
 
@@ -1795,6 +1796,27 @@ class Ming(BaseModel):
   )
   ming_norm_audio_embeds: bool = Field(
       True, description="L2-normalize the projected audio embeddings (norm_query_embeds)."
+  )
+
+
+class MuseSpark(BaseModel):
+  """Configuration specific to Meta Muse-Spark models."""
+
+  muse_spark_post_norm_eps: float = Field(
+      1.0e-8,
+      description="Epsilon for Muse-Spark post-attention, post-expert, and post-feedforward RMSNorm layers.",
+  )
+  muse_spark_qk_scale_factor: float = Field(
+      5.4730064863875,
+      description="Multiplicative scale factor applied to query after scaleless QK RMSNorm.",
+  )
+  muse_spark_output_multiplier: float = Field(
+      0.17677669529663687,
+      description="Multiplicative scale factor applied to MoE router logits and final output head logits.",
+  )
+  muse_spark_residual_gate_temperature: float = Field(
+      0.3,
+      description="Temperature scaling factor for learnable Muse-Spark residual gates.",
   )
 
 
@@ -4168,6 +4190,7 @@ FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS = (
     DecoderBlockType.QWEN3_5,
     DecoderBlockType.MIXTRAL,
     DecoderBlockType.GEMMA4,
+    DecoderBlockType.MUSE_SPARK,
 )
 
 
@@ -4343,6 +4366,7 @@ class MaxTextConfig(
     Qwen3Next,
     Qwen3_8FlashNext,
     Ming,
+    MuseSpark,
     # Parallelism and Layout
     HardwareAndMesh,
     LayoutAndSharding,
@@ -6791,6 +6815,7 @@ class RLConfig(
     Qwen3Next,
     Qwen3_8FlashNext,
     Ming,
+    MuseSpark,
     MultimodalGeneral,
     Muon,
     FineTuning,

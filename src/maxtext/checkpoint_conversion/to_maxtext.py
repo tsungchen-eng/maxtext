@@ -50,7 +50,9 @@ Example Usage:
 """
 
 import argparse
+import asyncio
 from functools import partial
+import gc
 import json
 import os
 import sys
@@ -153,6 +155,7 @@ _FULL_PRECISION_SUBSTRINGS = (
     "-attn_hc-",
     "-ffn_hc-",
     "-hc_head-",
+    "-moe_block-gate-kernel",
     "-self_attention-sinks",
     "-self_attention-indexer-k_norm-",
     "-self_attention-indexer-weights_proj-",
@@ -391,6 +394,52 @@ class LazyTensorHandler(type_handlers.NumpyHandler):
 # Register LazyTensor with the custom handler.
 # It's safe to register this globally even if eager loading is used.
 type_handlers.register_type_handler(LazyTensor, LazyTensorHandler(), override=True)
+
+try:
+  from orbax.checkpoint.experimental.v1._src.serialization import (  # pylint: disable=g-import-not-at-top
+      numpy_leaf_handler as _orbax_v1_numpy_leaf_handler,
+      registry as _orbax_v1_registry,
+      types as _orbax_v1_types,
+  )
+
+  if not any(
+      entry[0] is LazyTensor for entry in _orbax_v1_registry.STANDARD_TYPE_AND_ABSTRACT_TYPE_AND_TYPESTR_TO_HANDLER
+  ):
+    _orbax_v1_registry.STANDARD_TYPE_AND_ABSTRACT_TYPE_AND_TYPESTR_TO_HANDLER.append(
+        (
+            LazyTensor,
+            _orbax_v1_types.AbstractArray,
+            ["np.ndarray"],
+            _orbax_v1_numpy_leaf_handler.NumpyLeafHandler,
+        )
+    )
+except ImportError:
+  pass
+
+_orig_numpy_open_and_write = type_handlers.NumpyHandler._open_and_write  # pylint: disable=protected-access
+_lazy_write_semaphore: asyncio.Semaphore | None = None
+_lazy_write_loop: asyncio.AbstractEventLoop | None = None
+
+
+async def _lazy_open_and_write(self, value, tspec, ts_context):
+  """Materializes LazyTensor leaves one at a time when writing via NumpyHandler."""
+  global _lazy_write_semaphore, _lazy_write_loop
+  if isinstance(value, LazyTensor):
+    loop = asyncio.get_running_loop()
+    if _lazy_write_semaphore is None or _lazy_write_loop is not loop:
+      _lazy_write_semaphore = asyncio.Semaphore(1)
+      _lazy_write_loop = loop
+    async with _lazy_write_semaphore:
+      arr = np.asarray(value)
+      try:
+        return await _orig_numpy_open_and_write(self, arr, tspec, ts_context)
+      finally:
+        del arr
+        gc.collect()
+  return await _orig_numpy_open_and_write(self, value, tspec, ts_context)
+
+
+type_handlers.NumpyHandler._open_and_write = _lazy_open_and_write  # pylint: disable=protected-access
 
 
 def get_maxtext_model_info(config):
